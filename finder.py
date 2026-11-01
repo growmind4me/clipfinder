@@ -6,7 +6,7 @@ from youtube_transcript_api import YouTubeTranscriptApi
 from google import genai
 
 # ---- ফিক্স করা সেটিংস (দরকার হলে এখানে বদলান) ----
-MODEL = "gemini-2.5-flash"
+MODEL = "gemini-3.8-flash"
 MIN_LEN = 20
 MAX_LEN = 60
 NUM_CLIPS = 10
