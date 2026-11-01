@@ -9,11 +9,11 @@ from google import genai
 from google.genai import types
 
 # ---- ফিক্স করা সেটিংস (দরকার হলে এখানে বদলান) ----
-MODEL = "gemini-3.8-flash"
+DEFAULT_MODEL = "gemini-3.8-flash"
 MIN_LEN = 20
 MAX_LEN = 60
 NUM_CLIPS = 10
-CALL_TIMEOUT_SEC = 120   # প্রতি কলে সর্বোচ্চ অপেক্ষা
+CALL_TIMEOUT_SEC = 90    # প্রতি কলে সর্বোচ্চ অপেক্ষা
 PART_LINES = 120         # ২০ সেকেন্ডের ব্লক × ১২০ = প্রায় ৪০ মিনিট প্রতি ভাগ
 # ------------------------------------------------
 
@@ -26,6 +26,8 @@ except Exception:
     api_key = ""
 if not api_key:
     api_key = st.sidebar.text_input("Gemini API Key", type="password")
+
+MODEL = st.sidebar.text_input("Gemini model (আটকে গেলে এখানে অন্য নাম দিন)", DEFAULT_MODEL)
 
 url = st.text_input("YouTube লিঙ্ক পেস্ট করুন")
 with st.expander("ট্রান্সক্রিপ্ট আনতে এরর হলে এখানে নিজে পেস্ট করুন (ঐচ্ছিক)"):
@@ -100,7 +102,7 @@ def compress(items, bucket=20):
     return "\n".join(out)
 
 
-def find_moments(transcript, key, count):
+def find_moments(transcript, key, count, live):
     prompt = f"""You are an expert short-form video editor for motivational content.
 From the timestamped transcript below, pick the {count} best moments that could go viral
 as motivational Shorts/Reels/TikToks.
@@ -122,23 +124,42 @@ Transcript:
         api_key=key,
         http_options=types.HttpOptions(timeout=CALL_TIMEOUT_SEC * 1000),
     )
-    waits = [3, 6, 12]  # সাময়িক সমস্যায় এত সেকেন্ড অপেক্ষা করে আবার চেষ্টা
-    for attempt in range(len(waits) + 1):
+    use_thinking = True      # "চিন্তা" কম করার সেটিং; মডেল না নিলে বাদ দেওয়া হবে
+    waits = [3, 6, 12]
+    attempt = 0
+    while True:
         try:
-            r = client.models.generate_content(
-                model=MODEL, contents=prompt,
-                config={"response_mime_type": "application/json"},
-            )
-            return json.loads(r.text)
+            cfg = None
+            if use_thinking:
+                try:
+                    cfg = types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        thinking_config=types.ThinkingConfig(thinking_level="low"),
+                    )
+                except Exception:
+                    use_thinking = False
+            if cfg is None:
+                cfg = types.GenerateContentConfig(response_mime_type="application/json")
+            text, t1 = "", time.time()
+            live.write("📤 Gemini-কে পাঠানো হয়েছে, উত্তরের অপেক্ষা...")
+            for ch in client.models.generate_content_stream(model=MODEL, contents=prompt, config=cfg):
+                if ch.text:
+                    text += ch.text
+                    live.write(f"📥 উত্তর আসছে... {len(text)} অক্ষর ({int(time.time() - t1)} সেকেন্ড)")
+            return json.loads(text)
         except Exception as e:
-            msg = str(e)
-            temporary = any(c in msg.lower() for c in (
+            msg = str(e).lower()
+            if use_thinking and ("thinking" in msg or "invalid_argument" in msg):
+                use_thinking = False
+                continue
+            temporary = isinstance(e, json.JSONDecodeError) or any(c in msg for c in (
                 "503", "429", "504", "unavailable", "resource_exhausted",
                 "deadline", "timeout", "timed out"))
-            if not temporary or attempt == len(waits):
+            if not temporary or attempt >= len(waits):
                 raise
-            st.toast(f"Gemini ব্যস্ত/ধীর, {waits[attempt]} সেকেন্ড পর আবার চেষ্টা...")
+            live.write(f"⚠️ সমস্যা ({str(e)[:80]}...) — {waits[attempt]} সেকেন্ড পর আবার চেষ্টা")
             time.sleep(waits[attempt])
+            attempt += 1
 
 
 if st.button("সেরা ১০টা ক্লিপ খুঁজুন", disabled=not (url and api_key)):
@@ -163,15 +184,17 @@ if st.button("সেরা ১০টা ক্লিপ খুঁজুন", dis
 
     t0 = time.time()
     bar = st.progress(0.0, text="শুরু হচ্ছে...")
+    live = st.empty()
     moments, failed = [], 0
     for k, part in enumerate(parts, 1):
         bar.progress((k - 1) / len(parts),
                      text=f"ভাগ {k}/{len(parts)} বিশ্লেষণ হচ্ছে... ({int(time.time() - t0)} সেকেন্ড গেছে)")
         try:
-            moments += find_moments(part, api_key, per_part)
+            moments += find_moments(part, api_key, per_part, live)
         except Exception as e:
             failed += 1
             st.warning(f"ভাগ {k} ব্যর্থ হয়েছে: {e}")
+    live.empty()
     bar.progress(1.0, text=f"শেষ! মোট {int(time.time() - t0)} সেকেন্ড লেগেছে")
 
     moments = [m for m in moments if "start" in m and "end" in m]
