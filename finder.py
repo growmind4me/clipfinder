@@ -5,16 +5,24 @@ import streamlit as st
 from youtube_transcript_api import YouTubeTranscriptApi
 from google import genai
 
-st.set_page_config(page_title="Viral Moment Finder", page_icon="🔥")
-st.title("🔥 Viral Moment Finder")
+# ---- ফিক্স করা সেটিংস (দরকার হলে এখানে বদলান) ----
+MODEL = "gemini-2.5-flash"
+MIN_LEN = 20
+MAX_LEN = 60
+NUM_CLIPS = 10
+# ------------------------------------------------
 
-api_key = st.sidebar.text_input("Gemini API Key", type="password")
-model_name = st.sidebar.text_input("Gemini model", "gemini-2.5-flash")
-langs = st.sidebar.text_input("Transcript languages (comma separated)", "bn,en")
-clip_len = st.sidebar.slider("Clip length (seconds)", 15, 90, 35)
-num_clips = st.sidebar.slider("How many moments", 1, 10, 5)
+st.set_page_config(page_title="Viral Clip Finder", page_icon="🔥")
+st.title("🔥 Motivational Viral Clip Finder")
 
-url = st.text_input("YouTube লিঙ্ক")
+try:
+    api_key = st.secrets["GEMINI_API_KEY"]
+except Exception:
+    api_key = ""
+if not api_key:
+    api_key = st.sidebar.text_input("Gemini API Key", type="password")
+
+url = st.text_input("YouTube লিঙ্ক পেস্ট করুন")
 with st.expander("ট্রান্সক্রিপ্ট আনতে এরর হলে এখানে নিজে পেস্ট করুন (ঐচ্ছিক)"):
     manual = st.text_area(
         "YouTube-এ ভিডিওর নিচে ... > Show transcript খুলে সব লেখা কপি করে এখানে দিন",
@@ -24,7 +32,7 @@ with st.expander("ট্রান্সক্রিপ্ট আনতে এর
 
 def video_id(u):
     p = urlparse(u)
-    if p.hostname in ("youtu.be",):
+    if p.hostname == "youtu.be":
         return p.path.lstrip("/")
     if p.path.startswith(("/shorts/", "/live/", "/embed/")):
         return p.path.split("/")[2]
@@ -37,30 +45,41 @@ def fmt(sec):
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
-def get_transcript(vid, languages):
-    api = YouTubeTranscriptApi()
-    fetched = api.fetch(vid, languages=languages)
-    return [(s.start, s.text.replace("\n", " ")) for s in fetched]
+def get_transcript(vid):
+    """যেকোনো ভাষার ট্রান্সক্রিপ্ট নেয়; মানুষের লেখা থাকলে সেটাই আগে।"""
+    tl = list(YouTubeTranscriptApi().list(vid))
+    tl.sort(key=lambda t: t.is_generated)
+    fetched = tl[0].fetch()
+    return "\n".join(f"[{s.start:.0f}] {s.text.replace(chr(10), ' ')}" for s in fetched)
 
 
-def find_moments(transcript, key, model, length, count):
-    prompt = f"""From this timestamped transcript, pick the {count} moments most likely to go
-viral as short clips (strong hook, emotional or surprising, complete thought, ~{length}s each).
-Use start/end in seconds based on the transcript timestamps.
-Return ONLY a JSON list:
+def find_moments(transcript, key):
+    prompt = f"""You are an expert short-form video editor for motivational content.
+From the timestamped transcript below, pick the {NUM_CLIPS} best moments that could go viral
+as motivational Shorts/Reels/TikToks.
+
+Rules:
+- Each clip MUST be between {MIN_LEN} and {MAX_LEN} seconds long (end minus start).
+- Start on a strong hook; end on a complete thought (never cut mid-sentence).
+- Prefer powerful, quotable, emotional, or surprising motivational lines.
+- Clips must not overlap.
+- Use start/end in seconds based on the transcript timestamps.
+- Write title, hook and why_viral in Bengali.
+
+Return ONLY a JSON list of exactly {NUM_CLIPS} items:
 [{{"start": 120, "end": 155, "title": "...", "hook": "...", "why_viral": "...", "score": 1-10}}]
 
 Transcript:
 {transcript}"""
     client = genai.Client(api_key=key)
     r = client.models.generate_content(
-        model=model, contents=prompt,
+        model=MODEL, contents=prompt,
         config={"response_mime_type": "application/json"},
     )
     return json.loads(r.text)
 
 
-if st.button("ভাইরাল অংশ খুঁজুন", disabled=not (url and api_key)):
+if st.button("সেরা ১০টা ক্লিপ খুঁজুন", disabled=not (url and api_key)):
     vid = video_id(url)
     if not vid:
         st.error("লিঙ্কটি ঠিক মনে হচ্ছে না।")
@@ -70,17 +89,18 @@ if st.button("ভাইরাল অংশ খুঁজুন", disabled=not (ur
             transcript = manual.strip()
         else:
             with st.spinner("ট্রান্সক্রিপ্ট আনা হচ্ছে..."):
-                lines = get_transcript(vid, [l.strip() for l in langs.split(",")])
-            transcript = "\n".join(f"[{t:.0f}] {x}" for t, x in lines)
-        with st.spinner("AI বিশ্লেষণ করছে..."):
-            moments = find_moments(transcript, api_key, model_name, clip_len, num_clips)
+                transcript = get_transcript(vid)
+        with st.spinner("AI সেরা ক্লিপ খুঁজছে... (১-২ মিনিট লাগতে পারে)"):
+            moments = find_moments(transcript, api_key)
     except Exception as e:
         st.error(f"সমস্যা হয়েছে: {e}")
         st.stop()
 
-    for m in sorted(moments, key=lambda x: -x.get("score", 0)):
-        st.subheader(f"⭐ {m.get('score', '?')}/10 — {m['title']}")
-        st.write(f"**সময়:** {fmt(m['start'])} → {fmt(m['end'])}")
+    moments = sorted(moments, key=lambda x: -x.get("score", 0))
+    for i, m in enumerate(moments, 1):
+        dur = int(m["end"] - m["start"])
+        st.subheader(f"{i}. ⭐ {m.get('score', '?')}/10 — {m['title']}")
+        st.write(f"**সময়:** {fmt(m['start'])} → {fmt(m['end'])} ({dur} সেকেন্ড)")
         st.write(f"**হুক:** {m.get('hook', '')}")
         st.write(f"**কেন ভাইরাল হতে পারে:** {m.get('why_viral', '')}")
         st.video(f"https://www.youtube.com/watch?v={vid}",
