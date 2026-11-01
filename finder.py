@@ -8,17 +8,18 @@ from youtube_transcript_api import YouTubeTranscriptApi
 from google import genai
 from google.genai import types
 
-# ---- ফিক্স করা সেটিংস (দরকার হলে এখানে বদলান) ----
+# ---- Fixed settings (edit here if needed) ----
 DEFAULT_MODEL = "gemini-3.8-flash"
 MIN_LEN = 20
 MAX_LEN = 60
 NUM_CLIPS = 10
-CALL_TIMEOUT_SEC = 90    # প্রতি কলে সর্বোচ্চ অপেক্ষা
-PART_LINES = 600         # ২০ সেকেন্ডের ব্লক × ৬০০ = প্রায় ২০০ মিনিট প্রতি ভাগ (বেশিরভাগ ভিডিও ১ রিকোয়েস্টে)
-# ------------------------------------------------
+CALL_TIMEOUT_SEC = 90    # max wait per Gemini call
+PART_LINES = 600         # 20-sec blocks x 600 = ~200 min per request (most videos = 1 request)
+# ----------------------------------------------
 
 st.set_page_config(page_title="Viral Clip Finder", page_icon="🔥")
 st.title("🔥 Motivational Viral Clip Finder")
+st.caption("ভাইরাল মোটিভেশনাল ক্লিপ ফাইন্ডার")
 
 try:
     api_key = st.secrets["GEMINI_API_KEY"]
@@ -27,9 +28,10 @@ except Exception:
 if not api_key:
     api_key = st.sidebar.text_input("Gemini API Key", type="password")
 
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def list_models(key):
-    """আপনার key-তে যে Flash মডেলগুলো আসলে চালু আছে তার তালিকা আনে।"""
+    """Lists the Flash models actually enabled for this API key."""
     client = genai.Client(api_key=key)
     out = []
     for m in client.models.list():
@@ -52,12 +54,12 @@ if AVAILABLE:
     idx = AVAILABLE.index(DEFAULT_MODEL) if DEFAULT_MODEL in AVAILABLE else 0
     MODEL = st.sidebar.selectbox("Gemini model", AVAILABLE, index=idx)
 else:
-    MODEL = st.sidebar.text_input("Gemini model (তালিকা আনা যায়নি, নাম নিজে দিন)", DEFAULT_MODEL)
+    MODEL = st.sidebar.text_input("Gemini model (list unavailable, type a name)", DEFAULT_MODEL)
 
-url = st.text_input("YouTube লিঙ্ক পেস্ট করুন")
-with st.expander("ট্রান্সক্রিপ্ট আনতে এরর হলে এখানে নিজে পেস্ট করুন (ঐচ্ছিক)"):
+url = st.text_input("Paste YouTube link / YouTube লিঙ্ক পেস্ট করুন")
+with st.expander("If fetching the transcript fails, paste it here (optional) / ট্রান্সক্রিপ্ট আনতে এরর হলে এখানে নিজে পেস্ট করুন (ঐচ্ছিক)"):
     manual = st.text_area(
-        "YouTube-এ ভিডিওর নিচে ... > Show transcript খুলে সব লেখা কপি করে এখানে দিন",
+        "On YouTube: ... under the video > Show transcript, copy everything / YouTube-এ ভিডিওর নিচে ... > Show transcript খুলে সব লেখা কপি করে এখানে দিন",
         height=150,
     )
 
@@ -78,7 +80,7 @@ def fmt(sec):
 
 
 def get_transcript(vid):
-    """যেকোনো ভাষার ট্রান্সক্রিপ্ট নেয়; মানুষের লেখা থাকলে সেটাই আগে।"""
+    """Fetches a transcript in any language; human-written first."""
     tl = list(YouTubeTranscriptApi().list(vid))
     tl.sort(key=lambda t: t.is_generated)
     fetched = tl[0].fetch()
@@ -89,7 +91,7 @@ TS = re.compile(r"^\[?(\d+):(\d{2})(?::(\d{2}))?\]?\s*(.*)$")
 
 
 def parse_manual(text):
-    """নিজে পেস্ট করা ট্রান্সক্রিপ্ট থেকে (সেকেন্ড, লেখা) তালিকা বানায়।"""
+    """Turns a pasted transcript into a list of (seconds, text)."""
     items, pending = [], None
     for ln in text.splitlines():
         ln = ln.strip()
@@ -113,7 +115,7 @@ def parse_manual(text):
 
 
 def compress(items, bucket=20):
-    """প্রতি ২০ সেকেন্ডের লেখা এক লাইনে জুড়ে দেয়, যাতে AI-কে কম পড়তে হয়।"""
+    """Merges each 20-second block into one line so the AI reads less."""
     out, cur, txt = [], None, []
     for sec, t in items:
         b = sec // bucket * bucket
@@ -128,16 +130,16 @@ def compress(items, bucket=20):
 
 
 def short_err(e):
-    """বিশাল এরর থেকে এক লাইনের বাংলা সারাংশ বানায়।"""
+    """One-line summary of a long API error."""
     s = str(e)
     if "429" in s or "RESOURCE_EXHAUSTED" in s:
         if re.search(r"limit: 0(?!\d)", s):
-            return "এই মডেলে ফ্রি টিয়ারে কোনো কোটাই নেই (limit 0)"
-        return "কোটা শেষ (429)"
+            return "no free-tier quota for this model (limit 0)"
+        return "quota exceeded (429)"
     if "404" in s or "NOT_FOUND" in s:
-        return "মডেলটি পাওয়া যায়নি (404)"
+        return "model not found (404)"
     if "503" in s or "UNAVAILABLE" in s:
-        return "মডেল এখন ব্যস্ত (503)"
+        return "model is busy (503)"
     return s[:150]
 
 
@@ -147,15 +149,21 @@ From the timestamped transcript below, pick the {count} best moments that could 
 as motivational Shorts/Reels/TikToks.
 
 Rules:
-- Each clip MUST be between {MIN_LEN} and {MAX_LEN} seconds long (end minus start).
-- Start on a strong hook; end on a complete thought (never cut mid-sentence).
+- Each clip MUST be between {MIN_LEN} and {MAX_LEN} seconds long (end minus start). Never exceed {MAX_LEN}.
+- Start at the beginning of a sentence with a strong hook; end on a complete thought
+  (never cut mid-sentence).
 - Prefer powerful, quotable, emotional, or surprising motivational lines.
 - Clips must not overlap.
 - Use start/end in seconds based on the transcript timestamps.
-- Write title, hook and why_viral in Bengali.
+- opening_line = the exact first sentence spoken in the clip, copied word for word from the transcript.
+- closing_line = the exact last sentence spoken in the clip, copied word for word from the transcript.
+- Write title, hook and why_viral in English, and give a natural Bengali translation of each
+  in title_bn, hook_bn and why_viral_bn.
+- Also give a natural Bengali translation of opening_line and closing_line in opening_line_bn
+  and closing_line_bn (the English/original lines stay exactly as spoken).
 
 Return ONLY a JSON list of {count} items:
-[{{"start": 120, "end": 155, "title": "...", "hook": "...", "why_viral": "...", "score": 1-10}}]
+[{{"start": 120, "end": 155, "title": "...", "title_bn": "...", "opening_line": "...", "opening_line_bn": "...", "closing_line": "...", "closing_line_bn": "...", "hook": "...", "hook_bn": "...", "why_viral": "...", "why_viral_bn": "...", "score": 1-10}}]
 
 Transcript:
 {transcript}"""
@@ -163,7 +171,7 @@ Transcript:
         api_key=key,
         http_options=types.HttpOptions(timeout=CALL_TIMEOUT_SEC * 1000),
     )
-    use_thinking = True      # "চিন্তা" কম করার সেটিং; মডেল না নিলে বাদ দেওয়া হবে
+    use_thinking = True      # low "thinking" setting; dropped if the model rejects it
     waits = [3, 6, 12]
     attempt = 0
     while True:
@@ -180,11 +188,11 @@ Transcript:
             if cfg is None:
                 cfg = types.GenerateContentConfig(response_mime_type="application/json")
             text, t1 = "", time.time()
-            live.write(f"📤 {model}-কে পাঠানো হয়েছে, উত্তরের অপেক্ষা...")
+            live.write(f"📤 Sent to {model}, waiting for a reply...")
             for ch in client.models.generate_content_stream(model=model, contents=prompt, config=cfg):
                 if ch.text:
                     text += ch.text
-                    live.write(f"📥 {model}: উত্তর আসছে... {len(text)} অক্ষর ({int(time.time() - t1)} সেকেন্ড)")
+                    live.write(f"📥 {model}: receiving reply... {len(text)} chars ({int(time.time() - t1)}s)")
             return json.loads(text)
         except Exception as e:
             msg = str(e).lower()
@@ -193,62 +201,69 @@ Transcript:
                 continue
             if "429" in msg or "resource_exhausted" in msg:
                 norm = re.sub(r"[^a-z0-9.]", "", msg)
-                if "perday" in norm or re.search(r"limit0(?!\d)", norm):   # দৈনিক কোটা শেষ বা ফ্রি কোটাই নেই: অপেক্ষা করে লাভ নেই
-                    raise
+                if "perday" in norm or re.search(r"limit0(?!\d)", norm):
+                    raise   # daily quota gone or no free quota: waiting is pointless
                 mm = re.search(r"retryin([\d.]+)s", norm) or re.search(r"retrydelay([\d.]+)s", norm)
                 delay = float(mm.group(1)) if mm else 30
                 if delay <= 70 and attempt < 2:
-                    live.write(f"⏳ কোটার সীমা, Google বলেছে {int(delay)} সেকেন্ড অপেক্ষা করতে...")
+                    live.write(f"⏳ Rate limit, Google asks to wait {int(delay)}s...")
                     time.sleep(delay + 1)
                     attempt += 1
                     continue
                 raise
-            temporary = isinstance(e, json.JSONDecodeError) or any(c in msg for c in (
-                "503", "unavailable"))
+            temporary = isinstance(e, json.JSONDecodeError) or any(c in msg for c in ("503", "unavailable"))
             if not temporary or attempt >= len(waits):
                 raise
-            live.write(f"⚠️ সমস্যা ({str(e)[:80]}...) — {waits[attempt]} সেকেন্ড পর আবার চেষ্টা")
+            live.write(f"⚠️ Problem ({str(e)[:80]}...). Retrying in {waits[attempt]}s")
             time.sleep(waits[attempt])
             attempt += 1
 
 
-if st.button("সেরা ১০টা ক্লিপ খুঁজুন", disabled=not (url and api_key)):
+def show(label_en, label_bn, en, bn, quote=False):
+    q = (lambda t: f"“{t}”") if quote else (lambda t: t)
+    st.markdown(f"**{label_en} / {label_bn}:** {q(en)}")
+    if bn:
+        st.write(f"↳ {q(bn)}")
+
+
+if st.button("Find the best 10 clips / সেরা ১০টা ক্লিপ খুঁজুন", disabled=not (url and api_key)):
     vid = video_id(url)
     if not vid:
-        st.error("লিঙ্কটি ঠিক মনে হচ্ছে না।")
+        st.error("That doesn't look like a valid YouTube link. / লিঙ্কটি ঠিক মনে হচ্ছে না।")
         st.stop()
     try:
         if manual.strip():
             items = parse_manual(manual)
             transcript = compress(items) if items else manual.strip()
         else:
-            with st.spinner("ট্রান্সক্রিপ্ট আনা হচ্ছে..."):
+            with st.spinner("Fetching transcript... / ট্রান্সক্রিপ্ট আনা হচ্ছে..."):
                 transcript = compress(get_transcript(vid))
     except Exception as e:
-        st.error(f"ট্রান্সক্রিপ্টে সমস্যা: {e}")
+        st.error(f"Transcript problem: {e}")
         st.stop()
 
     lines = transcript.splitlines()
     parts = ["\n".join(lines[i:i + PART_LINES]) for i in range(0, len(lines), PART_LINES)] or [transcript]
-    per_part = max(3, -(-NUM_CLIPS // len(parts)) + 1)
+    per_part = max(3, -(-NUM_CLIPS // len(parts)) + 3)   # a few extras, some get filtered out
 
     bad = st.session_state.setdefault("bad_models", set())
     candidates = [MODEL] + [m for m in AVAILABLE if m != MODEL]
     candidates = [m for m in candidates if m not in bad] or candidates
     candidates = candidates[:6]
+
     t0 = time.time()
-    bar = st.progress(0.0, text="শুরু হচ্ছে...")
+    bar = st.progress(0.0, text="Starting...")
     live = st.empty()
     moments, failed, quota_hit = [], 0, False
     for k, part in enumerate(parts, 1):
         bar.progress((k - 1) / len(parts),
-                     text=f"ভাগ {k}/{len(parts)} বিশ্লেষণ হচ্ছে... ({int(time.time() - t0)} সেকেন্ড গেছে)")
+                     text=f"Analyzing part {k}/{len(parts)}... / বিশ্লেষণ চলছে... ({int(time.time() - t0)}s)")
         done, tried = False, []
         for mdl in list(candidates):
             try:
                 moments += find_moments(part, api_key, per_part, live, mdl)
                 candidates.remove(mdl)
-                candidates.insert(0, mdl)   # যে মডেল কাজ করল সেটাই আগে
+                candidates.insert(0, mdl)   # the model that worked goes first
                 done = True
                 break
             except Exception as e:
@@ -256,40 +271,52 @@ if st.button("সেরা ১০টা ক্লিপ খুঁজুন", dis
                 tried.append(f"• **{mdl}**: {reason}")
                 if "limit 0" in reason or "404" in reason:
                     bad.add(mdl)
-                if "429" in reason or "কোটা" in reason:
+                if "429" in reason or "quota" in reason:
                     quota_hit = True
-                live.write(f"❌ {mdl}: {reason} — পরের মডেল চেষ্টা হচ্ছে...")
+                live.write(f"❌ {mdl}: {reason}. Trying the next model...")
         if not done:
             failed += 1
-            st.warning(f"ভাগ {k} কোনো মডেলেই হয়নি:\n\n" + "\n".join(tried))
-            break   # সব মডেল ব্যর্থ, বাকি ভাগে চেষ্টা করে লাভ নেই
+            st.warning(f"Part {k} failed on every model:\n\n" + "\n".join(tried))
+            break
     live.empty()
-    bar.progress(1.0, text=f"শেষ! মোট {int(time.time() - t0)} সেকেন্ড লেগেছে")
+    bar.progress(1.0, text=f"Done! Took {int(time.time() - t0)}s / শেষ! {int(time.time() - t0)} সেকেন্ড লেগেছে")
 
-    moments = [m for m in moments if "start" in m and "end" in m]
+    valid = []
+    for m in moments:
+        try:
+            dur = float(m["end"]) - float(m["start"])
+        except Exception:
+            continue
+        if MIN_LEN - 5 <= dur <= MAX_LEN + 10:   # drop clips far outside the 20-60s range
+            valid.append(m)
+    moments = valid
+
     if not moments:
         if quota_hit:
             st.error(
-                "কোনো মডেলেই ফ্রি কোটা পাওয়া যায়নি (429)। এটা আপনার কোডের ভুল নয়।\n\n"
-                "• উপরের তালিকায় দেখুন কোন মডেলে \"limit 0\" লেখা: ওগুলো ফ্রিতে চলে না।\n"
-                "• ১-২ মিনিট পর আবার চেষ্টা করুন (প্রতি-মিনিটের সীমা হলে)।\n"
-                "• না হলে ২৪ ঘণ্টা পর চেষ্টা করুন (দৈনিক সীমা হলে)।\n"
-                "• সাইডবার থেকে অন্য মডেল বেছে দেখুন, প্রতিটি মডেলের আলাদা কোটা থাকে।\n"
-                "• দ্রুত সমাধান: aistudio.google.com-এ billing চালু করা।"
+                "No model had free quota (429). This is not a bug in your code. / কোনো মডেলেই ফ্রি কোটা পাওয়া যায়নি, এটা আপনার কোডের ভুল নয়।\n\n"
+                "• Look at the list above: models showing \"limit 0\" don't run on the free tier.\n"
+                "• If it's a per-minute limit, try again in 1-2 minutes.\n"
+                "• If it's a daily limit, try again after 24 hours.\n"
+                "• Quick fix: enable billing at aistudio.google.com."
             )
         else:
-            st.error("কোনো ক্লিপ পাওয়া যায়নি। কিছুক্ষণ পর আবার চেষ্টা করুন।")
+            st.error("No clips found. Please try again in a little while. / কোনো ক্লিপ পাওয়া যায়নি, কিছুক্ষণ পর আবার চেষ্টা করুন।")
         st.stop()
     if failed:
-        st.info(f"{failed}টা ভাগ ব্যর্থ হওয়ায় কিছু অংশের ক্লিপ নেই। আবার চেষ্টা করলে বাকিটাও পেতে পারেন।")
+        st.info("Part of the video failed, so some sections have no clips. Try again to get the rest.")
 
     moments = sorted(moments, key=lambda x: -x.get("score", 0))[:NUM_CLIPS]
     for i, m in enumerate(moments, 1):
         dur = int(m["end"] - m["start"])
-        st.subheader(f"{i}. ⭐ {m.get('score', '?')}/10 — {m.get('title', '')}")
-        st.write(f"**সময়:** {fmt(m['start'])} → {fmt(m['end'])} ({dur} সেকেন্ড)")
-        st.write(f"**হুক:** {m.get('hook', '')}")
-        st.write(f"**কেন ভাইরাল হতে পারে:** {m.get('why_viral', '')}")
+        st.subheader(f"{i}. ⭐ {m.get('score', '?')}/10: {m.get('title', '')}")
+        if m.get("title_bn"):
+            st.write(f"↳ **{m['title_bn']}**")
+        st.markdown(f"**Time / সময়:** {fmt(m['start'])} → {fmt(m['end'])} ({dur} seconds / সেকেন্ড)")
+        show("Opening line", "শুরুর বাক্য", m.get("opening_line", ""), m.get("opening_line_bn", ""), quote=True)
+        show("Closing line", "শেষের বাক্য", m.get("closing_line", ""), m.get("closing_line_bn", ""), quote=True)
+        show("Hook", "হুক", m.get("hook", ""), m.get("hook_bn", ""))
+        show("Why it could go viral", "কেন ভাইরাল হতে পারে", m.get("why_viral", ""), m.get("why_viral_bn", ""))
         st.video(f"https://www.youtube.com/watch?v={vid}",
                  start_time=int(m["start"]), end_time=int(m["end"]))
         cmd = (
@@ -298,6 +325,6 @@ if st.button("সেরা ১০টা ক্লিপ খুঁজুন", dis
             f'--force-keyframes-at-cuts -o "clip_{i}.%(ext)s" '
             f'"https://www.youtube.com/watch?v={vid}"'
         )
-        with st.expander("⬇️ এই ক্লিপ ডাউনলোডের কমান্ড (নিজের কম্পিউটারে চালান)"):
+        with st.expander("⬇️ Download command for this clip (run on your computer) / এই ক্লিপ ডাউনলোডের কমান্ড (নিজের কম্পিউটারে চালান)"):
             st.code(cmd, language="bash")
         st.divider()
