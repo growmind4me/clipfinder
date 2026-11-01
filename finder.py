@@ -27,7 +27,32 @@ except Exception:
 if not api_key:
     api_key = st.sidebar.text_input("Gemini API Key", type="password")
 
-MODEL = st.sidebar.text_input("Gemini model (আটকে গেলে এখানে অন্য নাম দিন)", DEFAULT_MODEL)
+@st.cache_data(ttl=3600, show_spinner=False)
+def list_models(key):
+    """আপনার key-তে যে Flash মডেলগুলো আসলে চালু আছে তার তালিকা আনে।"""
+    client = genai.Client(api_key=key)
+    out = []
+    for m in client.models.list():
+        name = (m.name or "").replace("models/", "")
+        actions = getattr(m, "supported_actions", None) or []
+        ok = (not actions) or ("generateContent" in actions)
+        bad = ("image", "tts", "live", "audio", "embedding", "robotics", "computer")
+        if "flash" in name and ok and not any(x in name for x in bad):
+            out.append(name)
+    return sorted(set(out), reverse=True)
+
+
+AVAILABLE = []
+if api_key:
+    try:
+        AVAILABLE = list_models(api_key)
+    except Exception:
+        AVAILABLE = []
+if AVAILABLE:
+    idx = AVAILABLE.index(DEFAULT_MODEL) if DEFAULT_MODEL in AVAILABLE else 0
+    MODEL = st.sidebar.selectbox("Gemini model", AVAILABLE, index=idx)
+else:
+    MODEL = st.sidebar.text_input("Gemini model (তালিকা আনা যায়নি, নাম নিজে দিন)", DEFAULT_MODEL)
 
 url = st.text_input("YouTube লিঙ্ক পেস্ট করুন")
 with st.expander("ট্রান্সক্রিপ্ট আনতে এরর হলে এখানে নিজে পেস্ট করুন (ঐচ্ছিক)"):
@@ -102,7 +127,7 @@ def compress(items, bucket=20):
     return "\n".join(out)
 
 
-def find_moments(transcript, key, count, live):
+def find_moments(transcript, key, count, live, model):
     prompt = f"""You are an expert short-form video editor for motivational content.
 From the timestamped transcript below, pick the {count} best moments that could go viral
 as motivational Shorts/Reels/TikToks.
@@ -141,11 +166,11 @@ Transcript:
             if cfg is None:
                 cfg = types.GenerateContentConfig(response_mime_type="application/json")
             text, t1 = "", time.time()
-            live.write("📤 Gemini-কে পাঠানো হয়েছে, উত্তরের অপেক্ষা...")
-            for ch in client.models.generate_content_stream(model=MODEL, contents=prompt, config=cfg):
+            live.write(f"📤 {model}-কে পাঠানো হয়েছে, উত্তরের অপেক্ষা...")
+            for ch in client.models.generate_content_stream(model=model, contents=prompt, config=cfg):
                 if ch.text:
                     text += ch.text
-                    live.write(f"📥 উত্তর আসছে... {len(text)} অক্ষর ({int(time.time() - t1)} সেকেন্ড)")
+                    live.write(f"📥 {model}: উত্তর আসছে... {len(text)} অক্ষর ({int(time.time() - t1)} সেকেন্ড)")
             return json.loads(text)
         except Exception as e:
             msg = str(e).lower()
@@ -153,8 +178,7 @@ Transcript:
                 use_thinking = False
                 continue
             temporary = isinstance(e, json.JSONDecodeError) or any(c in msg for c in (
-                "503", "429", "504", "unavailable", "resource_exhausted",
-                "deadline", "timeout", "timed out"))
+                "503", "429", "unavailable", "resource_exhausted"))
             if not temporary or attempt >= len(waits):
                 raise
             live.write(f"⚠️ সমস্যা ({str(e)[:80]}...) — {waits[attempt]} সেকেন্ড পর আবার চেষ্টা")
@@ -182,6 +206,7 @@ if st.button("সেরা ১০টা ক্লিপ খুঁজুন", dis
     parts = ["\n".join(lines[i:i + PART_LINES]) for i in range(0, len(lines), PART_LINES)] or [transcript]
     per_part = max(3, -(-NUM_CLIPS // len(parts)) + 1)
 
+    candidates = [MODEL] + [m for m in AVAILABLE if m != MODEL][:2]
     t0 = time.time()
     bar = st.progress(0.0, text="শুরু হচ্ছে...")
     live = st.empty()
@@ -189,11 +214,20 @@ if st.button("সেরা ১০টা ক্লিপ খুঁজুন", dis
     for k, part in enumerate(parts, 1):
         bar.progress((k - 1) / len(parts),
                      text=f"ভাগ {k}/{len(parts)} বিশ্লেষণ হচ্ছে... ({int(time.time() - t0)} সেকেন্ড গেছে)")
-        try:
-            moments += find_moments(part, api_key, per_part, live)
-        except Exception as e:
+        done, last_err = False, None
+        for mdl in candidates:
+            try:
+                moments += find_moments(part, api_key, per_part, live, mdl)
+                candidates.remove(mdl)
+                candidates.insert(0, mdl)   # যে মডেল কাজ করল সেটাই আগে
+                done = True
+                break
+            except Exception as e:
+                last_err = e
+                st.toast(f"{mdl} কাজ করেনি, পরের মডেল চেষ্টা হচ্ছে...")
+        if not done:
             failed += 1
-            st.warning(f"ভাগ {k} ব্যর্থ হয়েছে: {e}")
+            st.warning(f"ভাগ {k} ব্যর্থ হয়েছে: {last_err}")
     live.empty()
     bar.progress(1.0, text=f"শেষ! মোট {int(time.time() - t0)} সেকেন্ড লেগেছে")
 
