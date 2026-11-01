@@ -1,4 +1,5 @@
 import json
+import time
 from urllib.parse import urlparse, parse_qs
 
 import streamlit as st
@@ -72,11 +73,21 @@ Return ONLY a JSON list of exactly {NUM_CLIPS} items:
 Transcript:
 {transcript}"""
     client = genai.Client(api_key=key)
-    r = client.models.generate_content(
-        model=MODEL, contents=prompt,
-        config={"response_mime_type": "application/json"},
-    )
-    return json.loads(r.text)
+    waits = [5, 10, 20, 40, 60]  # ব্যস্ত থাকলে এত সেকেন্ড অপেক্ষা করে আবার চেষ্টা
+    for attempt in range(len(waits) + 1):
+        try:
+            r = client.models.generate_content(
+                model=MODEL, contents=prompt,
+                config={"response_mime_type": "application/json"},
+            )
+            return json.loads(r.text)
+        except Exception as e:
+            msg = str(e)
+            temporary = any(c in msg for c in ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED"))
+            if not temporary or attempt == len(waits):
+                raise
+            st.toast(f"Gemini ব্যস্ত, {waits[attempt]} সেকেন্ড পর আবার চেষ্টা হচ্ছে...")
+            time.sleep(waits[attempt])
 
 
 if st.button("সেরা ১০টা ক্লিপ খুঁজুন", disabled=not (url and api_key)):
