@@ -14,7 +14,7 @@ MIN_LEN = 20
 MAX_LEN = 60
 NUM_CLIPS = 10
 CALL_TIMEOUT_SEC = 90    # প্রতি কলে সর্বোচ্চ অপেক্ষা
-PART_LINES = 120         # ২০ সেকেন্ডের ব্লক × ১২০ = প্রায় ৪০ মিনিট প্রতি ভাগ
+PART_LINES = 600         # ২০ সেকেন্ডের ব্লক × ৬০০ = প্রায় ২০০ মিনিট প্রতি ভাগ (বেশিরভাগ ভিডিও ১ রিকোয়েস্টে)
 # ------------------------------------------------
 
 st.set_page_config(page_title="Viral Clip Finder", page_icon="🔥")
@@ -127,6 +127,20 @@ def compress(items, bucket=20):
     return "\n".join(out)
 
 
+def short_err(e):
+    """বিশাল এরর থেকে এক লাইনের বাংলা সারাংশ বানায়।"""
+    s = str(e)
+    if "429" in s or "RESOURCE_EXHAUSTED" in s:
+        if re.search(r"limit: 0(?!\d)", s):
+            return "এই মডেলে ফ্রি টিয়ারে কোনো কোটাই নেই (limit 0)"
+        return "কোটা শেষ (429)"
+    if "404" in s or "NOT_FOUND" in s:
+        return "মডেলটি পাওয়া যায়নি (404)"
+    if "503" in s or "UNAVAILABLE" in s:
+        return "মডেল এখন ব্যস্ত (503)"
+    return s[:150]
+
+
 def find_moments(transcript, key, count, live, model):
     prompt = f"""You are an expert short-form video editor for motivational content.
 From the timestamped transcript below, pick the {count} best moments that could go viral
@@ -177,8 +191,20 @@ Transcript:
             if use_thinking and ("thinking" in msg or "invalid_argument" in msg):
                 use_thinking = False
                 continue
+            if "429" in msg or "resource_exhausted" in msg:
+                norm = re.sub(r"[^a-z0-9.]", "", msg)
+                if "perday" in norm or re.search(r"limit0(?!\d)", norm):   # দৈনিক কোটা শেষ বা ফ্রি কোটাই নেই: অপেক্ষা করে লাভ নেই
+                    raise
+                mm = re.search(r"retryin([\d.]+)s", norm) or re.search(r"retrydelay([\d.]+)s", norm)
+                delay = float(mm.group(1)) if mm else 30
+                if delay <= 70 and attempt < 2:
+                    live.write(f"⏳ কোটার সীমা, Google বলেছে {int(delay)} সেকেন্ড অপেক্ষা করতে...")
+                    time.sleep(delay + 1)
+                    attempt += 1
+                    continue
+                raise
             temporary = isinstance(e, json.JSONDecodeError) or any(c in msg for c in (
-                "503", "429", "unavailable", "resource_exhausted"))
+                "503", "unavailable"))
             if not temporary or attempt >= len(waits):
                 raise
             live.write(f"⚠️ সমস্যা ({str(e)[:80]}...) — {waits[attempt]} সেকেন্ড পর আবার চেষ্টা")
@@ -206,16 +232,19 @@ if st.button("সেরা ১০টা ক্লিপ খুঁজুন", dis
     parts = ["\n".join(lines[i:i + PART_LINES]) for i in range(0, len(lines), PART_LINES)] or [transcript]
     per_part = max(3, -(-NUM_CLIPS // len(parts)) + 1)
 
-    candidates = [MODEL] + [m for m in AVAILABLE if m != MODEL][:2]
+    bad = st.session_state.setdefault("bad_models", set())
+    candidates = [MODEL] + [m for m in AVAILABLE if m != MODEL]
+    candidates = [m for m in candidates if m not in bad] or candidates
+    candidates = candidates[:6]
     t0 = time.time()
     bar = st.progress(0.0, text="শুরু হচ্ছে...")
     live = st.empty()
-    moments, failed = [], 0
+    moments, failed, quota_hit = [], 0, False
     for k, part in enumerate(parts, 1):
         bar.progress((k - 1) / len(parts),
                      text=f"ভাগ {k}/{len(parts)} বিশ্লেষণ হচ্ছে... ({int(time.time() - t0)} সেকেন্ড গেছে)")
-        done, last_err = False, None
-        for mdl in candidates:
+        done, tried = False, []
+        for mdl in list(candidates):
             try:
                 moments += find_moments(part, api_key, per_part, live, mdl)
                 candidates.remove(mdl)
@@ -223,17 +252,33 @@ if st.button("সেরা ১০টা ক্লিপ খুঁজুন", dis
                 done = True
                 break
             except Exception as e:
-                last_err = e
-                st.toast(f"{mdl} কাজ করেনি, পরের মডেল চেষ্টা হচ্ছে...")
+                reason = short_err(e)
+                tried.append(f"• **{mdl}**: {reason}")
+                if "limit 0" in reason or "404" in reason:
+                    bad.add(mdl)
+                if "429" in reason or "কোটা" in reason:
+                    quota_hit = True
+                live.write(f"❌ {mdl}: {reason} — পরের মডেল চেষ্টা হচ্ছে...")
         if not done:
             failed += 1
-            st.warning(f"ভাগ {k} ব্যর্থ হয়েছে: {last_err}")
+            st.warning(f"ভাগ {k} কোনো মডেলেই হয়নি:\n\n" + "\n".join(tried))
+            break   # সব মডেল ব্যর্থ, বাকি ভাগে চেষ্টা করে লাভ নেই
     live.empty()
     bar.progress(1.0, text=f"শেষ! মোট {int(time.time() - t0)} সেকেন্ড লেগেছে")
 
     moments = [m for m in moments if "start" in m and "end" in m]
     if not moments:
-        st.error("কোনো ক্লিপ পাওয়া যায়নি। কিছুক্ষণ পর আবার চেষ্টা করুন।")
+        if quota_hit:
+            st.error(
+                "কোনো মডেলেই ফ্রি কোটা পাওয়া যায়নি (429)। এটা আপনার কোডের ভুল নয়।\n\n"
+                "• উপরের তালিকায় দেখুন কোন মডেলে \"limit 0\" লেখা: ওগুলো ফ্রিতে চলে না।\n"
+                "• ১-২ মিনিট পর আবার চেষ্টা করুন (প্রতি-মিনিটের সীমা হলে)।\n"
+                "• না হলে ২৪ ঘণ্টা পর চেষ্টা করুন (দৈনিক সীমা হলে)।\n"
+                "• সাইডবার থেকে অন্য মডেল বেছে দেখুন, প্রতিটি মডেলের আলাদা কোটা থাকে।\n"
+                "• দ্রুত সমাধান: aistudio.google.com-এ billing চালু করা।"
+            )
+        else:
+            st.error("কোনো ক্লিপ পাওয়া যায়নি। কিছুক্ষণ পর আবার চেষ্টা করুন।")
         st.stop()
     if failed:
         st.info(f"{failed}টা ভাগ ব্যর্থ হওয়ায় কিছু অংশের ক্লিপ নেই। আবার চেষ্টা করলে বাকিটাও পেতে পারেন।")
